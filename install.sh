@@ -110,10 +110,9 @@ PORT_HY2="${USER_PORT_HY2:-$(rand_port)}"
 PSK_HY2=$(rand_pass)
 
 # -----------------------
-# 核心安装：初次安装即直接抓取最新版 + 强制控速防爆机制
+# 核心安装：初次安装即直接抓取最新版 + 严格控序防爆机制
 install_singbox() {
     info "正在检索 Github 最新 sing-box 稳定版版本号..."
-    # 免 jq 轻量提取最新版本号
     LATEST_VER=$(curl -sSL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest | awk -F '"' '/tag_name/{print $4}' | sed 's/^v//')
     
     if [ -z "$LATEST_VER" ]; then
@@ -130,22 +129,21 @@ install_singbox() {
     fi
     
     info "正在以 1MB/s 安全限速下载 linux-${ARCH} 核心压缩包..."
-    # 🎯 初次安装同样锁死 --limit-rate 1M 防爆运存
-    if curl -fSL --limit-rate 1M --connect-timeout 15 --retry 3 -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-linux-${ARCH}.tar.gz"; then
-        
-        # 🎯 在解压新版大体积核心前，强力回收小鸡系统多余内存
-        echo "下载成功！正在强力释放小鸡缓存以保障解压安全..."
-        sync && echo 3 > /proc/sys/vm/drop_caches || true
-        
-        echo "开始解压最新核心..."
-        tar -zxf sb.tar.gz
-        mkdir -p /usr/bin
-        mv sing-box-${LATEST_VER}-linux-${ARCH}/sing-box /usr/bin/sing-box
-        chmod +x /usr/bin/sing-box
-    else
-        err "从 Github 下载最新核心失败，请检查海外小鸡与 Github 的连接情况。"
-        exit 1
-    fi
+    # 严格限速下载
+    curl -fSL --limit-rate 1M --connect-timeout 15 --retry 3 -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-linux-${ARCH}.tar.gz" || { err "从 Github 下载核心失败"; exit 1; }
+    
+    # 🎯【核心精修点】下载刚刚结束，立刻强制休眠2秒给内核网络缓冲区一点释放时间，然后强刷空内存！
+    info "核心下载成功！强制休眠复位并清空小鸡缓存..."
+    sleep 2
+    sync && echo 3 > /proc/sys/vm/drop_caches || true
+    sleep 1
+    
+    # 此时内存已处于最清空状态，再执行解压
+    info "开始解压最新核心..."
+    tar -zxf sb.tar.gz
+    mkdir -p /usr/bin
+    mv sing-box-${LATEST_VER}-linux-${ARCH}/sing-box /usr/bin/sing-box
+    chmod +x /usr/bin/sing-box
     
     cd / && rm -rf /tmp/sb-download
     info "sing-box 最新核心提取并部署成功！"
@@ -375,8 +373,10 @@ while true; do
             echo "正在以 1MB/s 安全限速下载新核心..."
             if curl -fSL --limit-rate 1M --connect-timeout 15 --retry 3 -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-linux-${ARCH}.tar.gz"; then
                 
-                echo "下载成功！正在强力回收小鸡系统多余内存..."
+                echo "下载成功！强制休眠复位并清空小鸡缓存..."
+                sleep 2
                 sync && echo 3 > /proc/sys/vm/drop_caches || true
+                sleep 1
                 
                 echo "开始解压新程序..."
                 tar -zxf sb.tar.gz
