@@ -8,8 +8,8 @@ warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
 # -----------------------
-# 强力清空系统缓存，释放可用内存
-sync
+# 彻底清理缓存（兼容只读文件系统）
+sync || true
 
 # -----------------------
 # 检测系统类型
@@ -41,13 +41,13 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 # -----------------------
-# 安装极其基础的依赖（去掉了 jq）
+# 安装极其基础的依赖
 install_deps() {
     info "安装系统依赖..."
     case "$OS" in
         alpine)
             apk update || true
-            apk add --no-cache bash curl ca-certificates openssl openrc || { err "依赖安装失败"; exit 1; }
+            apk add --no-cache bash curl ca-certificates openssl || { err "依赖安装失败"; exit 1; }
             ;;
         debian)
             export DEBIAN_FRONTEND=noninteractive
@@ -102,7 +102,7 @@ REALITY_SNI="$(echo "${REALITY_SNI:-itunes.apple.com}" | tr -d '[:space:]')"
 
 # -----------------------
 # 获取端口配置
-info "配置端口和密码（输入回车可自动生成随机端口）..."
+info "配置端口和密码..."
 read -p "请输入 VLESS Reality 端口 [默认随机]: " USER_PORT_REALITY
 PORT_REALITY="${USER_PORT_REALITY:-$(rand_port)}"
 UUID_REALITY=$(rand_uuid)
@@ -112,30 +112,37 @@ PORT_HY2="${USER_PORT_HY2:-$(rand_port)}"
 PSK_HY2=$(rand_pass)
 
 # -----------------------
-# 安装 sing-box 核心
+# 【核心修改点】绕过包管理器，直接下载官方编译好的独立单文件核心 (零内存占用)
 install_singbox() {
-    info "开始安装 sing-box 核心..."
-    if command -v sing-box >/dev/null 2>&1; then
-        warn "检测到已安装 sing-box，将覆盖重装..."
+    info "开始采用【零内存消耗模式】下载 sing-box 核心..."
+    mkdir -p /tmp/sb-download && cd /tmp/sb-download
+    
+    # 动态检测机器架构 (支持 amd64/arm64)
+    ARCH="amd64"
+    if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+        ARCH="arm64"
     fi
-
-    case "$OS" in
-        alpine)
-            apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || { err "sing-box 安装失败"; exit 1; }
-            ;;
-        debian|redhat)
-            bash <(curl -fsSL https://sing-box.app/install.sh) || { err "sing-box 安装失败"; exit 1; }
-            ;;
-        *)
-            err "不支持的系统"; exit 1 ;;
-    esac
+    
+    SB_VER="1.11.0"
+    info "正在下载 sing-box v${SB_VER} linux-${ARCH} 核心..."
+    
+    # 使用 curl 下载官方二进制包
+    curl -Lo sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz" || { err "核心下载失败"; exit 1; }
+    
+    tar -zxf sb.tar.gz
+    mkdir -p /usr/bin
+    mv sing-box-${SB_VER}-linux-${ARCH}/sing-box /usr/bin/sing-box
+    chmod +x /usr/bin/sing-box
+    
+    cd / && rm -rf /tmp/sb-download
+    info "sing-box 核心解压并提取成功！"
 }
 install_singbox
 
 # -----------------------
 # 生成 Reality 密钥对
 info "生成 Reality 密钥对..."
-REALITY_KEYS=$(sing-box generate reality-keypair 2>/dev/null || echo -e "PrivateKey: xxx\nPublicKey: xxx")
+REALITY_KEYS=$(/usr/bin/sing-box generate reality-keypair 2>/dev/null || echo -e "PrivateKey: xxx\nPublicKey: xxx")
 REALITY_PK=$(echo "$REALITY_KEYS" | awk '/PrivateKey/ {print $2}')
 REALITY_PUB=$(echo "$REALITY_KEYS" | awk '/PublicKey/ {print $2}')
 REALITY_SID=$(openssl rand -hex 8)
@@ -154,7 +161,7 @@ if [ ! -f /etc/sing-box/certs/fullchain.pem ]; then
 fi
 
 # -----------------------
-# 使用原生无依赖的 cat 写入超轻量 config.json
+# 写入超轻量 config.json
 info "正在生成超轻量配置文件..."
 cat > /etc/sing-box/config.json <<EOF
 {
@@ -198,7 +205,7 @@ cat > /etc/sing-box/config.json <<EOF
 }
 EOF
 
-# 保存文本格式的环境缓存文件（替代原脚本庞大的缓存机制，彻底干掉 jq 读取逻辑）
+# 保存文本格式的环境缓存文件
 cat > /etc/sing-box/.config_cache <<EOF
 PORT_REALITY=${PORT_REALITY}
 UUID_REALITY=${UUID_REALITY}
@@ -274,7 +281,7 @@ info "输入 sb 可召唤超轻量管理面板"
 echo "=========================================="
 
 # -----------------------
-# 创建完全移除了 jq 工具的超轻量 sb 后台管理面板
+# 创建纯文本缓存版管理面板
 SB_PATH="/usr/local/bin/sb"
 cat > "$SB_PATH" <<'SB_SCRIPT'
 #!/usr/bin/env bash
@@ -289,7 +296,6 @@ if [ ! -f "$CACHE_FILE" ]; then
 fi
 . "$CACHE_FILE"
 
-# 识别系统控制命令
 if [ -f /etc/init.d/sing-box ]; then
     CMD_START="rc-service sing-box start"
     CMD_STOP="rc-service sing-box stop"
