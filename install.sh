@@ -110,9 +110,18 @@ PORT_HY2="${USER_PORT_HY2:-$(rand_port)}"
 PSK_HY2=$(rand_pass)
 
 # -----------------------
-# 核心安装：初次下载同样强制引入【防爆限速模式】
+# 核心安装：初次安装即直接抓取最新版 + 强制控速防爆机制
 install_singbox() {
-    info "开始采用【安全防爆限速模式】下载 sing-box 核心..."
+    info "正在检索 Github 最新 sing-box 稳定版版本号..."
+    # 免 jq 轻量提取最新版本号
+    LATEST_VER=$(curl -sSL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest | awk -F '"' '/tag_name/{print $4}' | sed 's/^v//')
+    
+    if [ -z "$LATEST_VER" ]; then
+        warn "无法连接 Github API 获取最新版，将默认采用保底稳定版 1.13.12"
+        LATEST_VER="1.13.12"
+    fi
+
+    info "开始采用【安全防爆限速模式】下载最新版 sing-box v${LATEST_VER}..."
     mkdir -p /tmp/sb-download && cd /tmp/sb-download
     
     ARCH="amd64"
@@ -120,20 +129,26 @@ install_singbox() {
         ARCH="arm64"
     fi
     
-    SB_VER="1.11.0"
-    info "正在以 1MB/s 安全限速下载 sing-box v${SB_VER}..."
-    
-    # 🎯 锁死 --limit-rate 1M 防爆运存
-    curl -fSL --limit-rate 1M --connect-timeout 15 --retry 3 -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz" || { err "核心下载失败"; exit 1; }
-    
-    info "核心下载成功，开始执行解压..."
-    tar -zxf sb.tar.gz
-    mkdir -p /usr/bin
-    mv sing-box-${SB_VER}-linux-${ARCH}/sing-box /usr/bin/sing-box
-    chmod +x /usr/bin/sing-box
+    info "正在以 1MB/s 安全限速下载 linux-${ARCH} 核心压缩包..."
+    # 🎯 初次安装同样锁死 --limit-rate 1M 防爆运存
+    if curl -fSL --limit-rate 1M --connect-timeout 15 --retry 3 -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-linux-${ARCH}.tar.gz"; then
+        
+        # 🎯 在解压新版大体积核心前，强力回收小鸡系统多余内存
+        echo "下载成功！正在强力释放小鸡缓存以保障解压安全..."
+        sync && echo 3 > /proc/sys/vm/drop_caches || true
+        
+        echo "开始解压最新核心..."
+        tar -zxf sb.tar.gz
+        mkdir -p /usr/bin
+        mv sing-box-${LATEST_VER}-linux-${ARCH}/sing-box /usr/bin/sing-box
+        chmod +x /usr/bin/sing-box
+    else
+        err "从 Github 下载最新核心失败，请检查海外小鸡与 Github 的连接情况。"
+        exit 1
+    fi
     
     cd / && rm -rf /tmp/sb-download
-    info "sing-box 核心解压并提取成功！"
+    info "sing-box 最新核心提取并部署成功！"
 }
 install_singbox
 
@@ -270,7 +285,7 @@ fi
 # 输出快捷链接
 echo ""
 echo "=========================================="
-info "🎉 极限精简控速特调版 Sing-box 部署完成!"
+info "🎉 极限精简控速特调版最新 Sing-box 部署完成!"
 echo "=========================================="
 echo ""
 echo "🔗 VLESS Reality 节点链接："
@@ -285,7 +300,7 @@ info "输入 sb 可召唤超轻量管理面板"
 echo "=========================================="
 
 # -----------------------
-# 创建纯文本缓存版、免 jq 的高级 sb 管理后台（方案 B 外科手术式升级特调）
+# 创建纯文本缓存版、免 jq 的高级 sb 管理后台
 SB_PATH="/usr/local/bin/sb"
 cat > "$SB_PATH" <<'SB_SCRIPT'
 #!/usr/bin/env bash
@@ -357,18 +372,15 @@ while true; do
             ARCH="amd64"
             if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then ARCH="arm64"; fi
             
-            # 🎯 方案 B 核心：严格限速 1M，拉长网络缓冲期，绝不挤压小鸡内存
             echo "正在以 1MB/s 安全限速下载新核心..."
             if curl -fSL --limit-rate 1M --connect-timeout 15 --retry 3 -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-linux-${ARCH}.tar.gz"; then
                 
-                # 🎯 方案 B 核心：在解压大体积新程序前，强制清空一次系统内核缓存
                 echo "下载成功！正在强力回收小鸡系统多余内存..."
                 sync && echo 3 > /proc/sys/vm/drop_caches || true
                 
                 echo "开始解压新程序..."
                 tar -zxf sb.tar.gz
                 
-                # 闪电替换
                 $CMD_STOP || true
                 mv sing-box-${LATEST_VER}-linux-${ARCH}/sing-box /usr/bin/sing-box
                 chmod +x /usr/bin/sing-box
