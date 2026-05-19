@@ -110,9 +110,9 @@ PORT_HY2="${USER_PORT_HY2:-$(rand_port)}"
 PSK_HY2=$(rand_pass)
 
 # -----------------------
-# 核心安装：静态文件提取，不消耗任何安装期内存
+# 核心安装：初次下载同样强制引入【防爆限速模式】
 install_singbox() {
-    info "开始采用【零内存消耗模式】下载 sing-box 核心..."
+    info "开始采用【安全防爆限速模式】下载 sing-box 核心..."
     mkdir -p /tmp/sb-download && cd /tmp/sb-download
     
     ARCH="amd64"
@@ -121,10 +121,12 @@ install_singbox() {
     fi
     
     SB_VER="1.11.0"
-    info "正在下载 sing-box v${SB_VER} linux-${ARCH} 核心..."
+    info "正在以 1MB/s 安全限速下载 sing-box v${SB_VER}..."
     
-    curl -fSL --connect-timeout 15 --retry 3 -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz" || { err "核心下载失败"; exit 1; }
+    # 🎯 锁死 --limit-rate 1M 防爆运存
+    curl -fSL --limit-rate 1M --connect-timeout 15 --retry 3 -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz" || { err "核心下载失败"; exit 1; }
     
+    info "核心下载成功，开始执行解压..."
     tar -zxf sb.tar.gz
     mkdir -p /usr/bin
     mv sing-box-${SB_VER}-linux-${ARCH}/sing-box /usr/bin/sing-box
@@ -201,7 +203,7 @@ cat > /etc/sing-box/config.json <<EOF
 }
 EOF
 
-# 保存文本格式的环境缓存文件（无jq依赖的核心基础）
+# 保存文本格式的环境缓存文件
 cat > /etc/sing-box/.config_cache <<EOF
 PORT_REALITY=${PORT_REALITY}
 UUID_REALITY=${UUID_REALITY}
@@ -268,7 +270,7 @@ fi
 # 输出快捷链接
 echo ""
 echo "=========================================="
-info "🎉 极限精简完美特调版 Sing-box 部署完成!"
+info "🎉 极限精简控速特调版 Sing-box 部署完成!"
 echo "=========================================="
 echo ""
 echo "🔗 VLESS Reality 节点链接："
@@ -283,7 +285,7 @@ info "输入 sb 可召唤超轻量管理面板"
 echo "=========================================="
 
 # -----------------------
-# 创建纯文本缓存版、免 jq 的高级 sb 管理后台（精准嵌入更新菜单）
+# 创建纯文本缓存版、免 jq 的高级 sb 管理后台（方案 B 外科手术式升级特调）
 SB_PATH="/usr/local/bin/sb"
 cat > "$SB_PATH" <<'SB_SCRIPT'
 #!/usr/bin/env bash
@@ -317,9 +319,9 @@ while true; do
     echo "1) 查看客户端节点链接"
     echo "2) 启动代理服务"
     echo "3) 停止代理服务"
-    echo "4) 重举代理服务"
+    echo "4) 重启代理服务"
     echo "5) 查看当前服务运行状态"
-    echo "6) 更新 sing-box 核心 (一键安全升级)"
+    echo "6) 更新 sing-box 核心 (限速防爆升级)"
     echo "7) 彻底卸载 sing-box"
     echo "0) 退出面板"
     echo "=================================="
@@ -342,12 +344,11 @@ while true; do
         5) echo "-----------------"; $CMD_STAT; echo "-----------------"; ;;
         6)
             echo "正在检索 Github 最新 sing-box 稳定版版本号..."
-            # 免 jq 的全新轻量化版本抓取逻辑，确保 72MB 内存绝不爆满
             LATEST_VER=$(curl -sSL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest | awk -F '"' '/tag_name/{print $4}' | sed 's/^v//')
             
             if [ -z "$LATEST_VER" ]; then
-                echo "[WARN] 无法连接 Github API 获取最新版，将默认尝试更新到 1.11.0"
-                LATEST_VER="1.11.0"
+                echo "[WARN] 无法连接 Github API 获取最新版，将默认尝试更新到 1.13.12"
+                LATEST_VER="1.13.12"
             fi
             
             echo "准备将 sing-box 核心平滑升级至 v${LATEST_VER}..."
@@ -356,14 +357,23 @@ while true; do
             ARCH="amd64"
             if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then ARCH="arm64"; fi
             
-            echo "下载中，请稍候..."
-            if curl -fSL --connect-timeout 15 --retry 3 -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-linux-${ARCH}.tar.gz"; then
+            # 🎯 方案 B 核心：严格限速 1M，拉长网络缓冲期，绝不挤压小鸡内存
+            echo "正在以 1MB/s 安全限速下载新核心..."
+            if curl -fSL --limit-rate 1M --connect-timeout 15 --retry 3 -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-linux-${ARCH}.tar.gz"; then
+                
+                # 🎯 方案 B 核心：在解压大体积新程序前，强制清空一次系统内核缓存
+                echo "下载成功！正在强力回收小鸡系统多余内存..."
+                sync && echo 3 > /proc/sys/vm/drop_caches || true
+                
+                echo "开始解压新程序..."
                 tar -zxf sb.tar.gz
+                
+                # 闪电替换
                 $CMD_STOP || true
                 mv sing-box-${LATEST_VER}-linux-${ARCH}/sing-box /usr/bin/sing-box
                 chmod +x /usr/bin/sing-box
                 $CMD_START || true
-                echo -e "\n\033[1;32m[SUCCESS] 核心已无缝平滑升级至 v${LATEST_VER}！\033[0m\n"
+                echo -e "\n\033[1;32m[SUCCESS] 核心已通过限速机制安全升级至 v${LATEST_VER}！\033[0m\n"
             else
                 echo "[ERR] 下载失败，请检查网络后重试。"
             fi
