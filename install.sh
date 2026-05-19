@@ -7,8 +7,7 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
-# -----------------------
-# 彻底清理缓存（兼容只读文件系统）
+# 彻底清理缓存（兼容 OpenVZ/LXD 只读文件系统）
 sync || true
 
 # -----------------------
@@ -21,7 +20,6 @@ detect_os() {
     else
         OS_ID=""; OS_ID_LIKE=""
     fi
-
     if echo "$OS_ID $OS_ID_LIKE" | grep -qi "alpine"; then
         OS="alpine"
     elif echo "$OS_ID $OS_ID_LIKE" | grep -Ei "debian|ubuntu" >/dev/null; then
@@ -41,7 +39,7 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 # -----------------------
-# 安装极其基础的依赖
+# 安装系统依赖（去掉了复杂的 jq）
 install_deps() {
     info "安装系统依赖..."
     case "$OS" in
@@ -102,22 +100,21 @@ REALITY_SNI="$(echo "${REALITY_SNI:-itunes.apple.com}" | tr -d '[:space:]')"
 
 # -----------------------
 # 获取端口配置
-info "配置端口和密码..."
-read -p "请输入 VLESS Reality 端口 [默认随机]: " USER_PORT_REALITY
+info "配置端口和密码（提示：由于是NAT小鸡，请务必填写服务商分给你的公网有效端口！）"
+read -p "请输入 VLESS Reality 端口: " USER_PORT_REALITY
 PORT_REALITY="${USER_PORT_REALITY:-$(rand_port)}"
 UUID_REALITY=$(rand_uuid)
 
-read -p "请输入 Hysteria 2 端口 [默认随机]: " USER_PORT_HY2
+read -p "请输入 Hysteria 2 端口: " USER_PORT_HY2
 PORT_HY2="${USER_PORT_HY2:-$(rand_port)}"
 PSK_HY2=$(rand_pass)
 
 # -----------------------
-# 【核心修改点】绕过包管理器，直接下载官方编译好的独立单文件核心 (零内存占用)
+# 安装 sing-box 核心：采用核心级纯静态文件下载，不走包管理器，内存消耗为 0
 install_singbox() {
     info "开始采用【零内存消耗模式】下载 sing-box 核心..."
     mkdir -p /tmp/sb-download && cd /tmp/sb-download
     
-    # 动态检测机器架构 (支持 amd64/arm64)
     ARCH="amd64"
     if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
         ARCH="arm64"
@@ -126,8 +123,8 @@ install_singbox() {
     SB_VER="1.11.0"
     info "正在下载 sing-box v${SB_VER} linux-${ARCH} 核心..."
     
-    # 使用 curl 下载官方二进制包
-    curl -Lo sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz" || { err "核心下载失败"; exit 1; }
+    # 限制连接超时与重试，防止后台卡死挂起吃网络缓冲区
+    curl -fSL --connect-timeout 15 --retry 3 -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz" || { err "核心下载失败，请检查网络"; exit 1; }
     
     tar -zxf sb.tar.gz
     mkdir -p /usr/bin
@@ -135,7 +132,7 @@ install_singbox() {
     chmod +x /usr/bin/sing-box
     
     cd / && rm -rf /tmp/sb-download
-    info "sing-box 核心解压并提取成功！"
+    info "sing-box 核心提取成功！"
 }
 install_singbox
 
@@ -205,7 +202,7 @@ cat > /etc/sing-box/config.json <<EOF
 }
 EOF
 
-# 保存文本格式的环境缓存文件
+# 保存纯文本格式的环境变量缓存，彻底绝育日常面板对 jq 的依赖
 cat > /etc/sing-box/.config_cache <<EOF
 PORT_REALITY=${PORT_REALITY}
 UUID_REALITY=${UUID_REALITY}
@@ -218,7 +215,7 @@ CUSTOM_IP=${CUSTOM_IP}
 EOF
 
 # -----------------------
-# 配置服务开机自启
+# 配置服务开机自启并强力守护
 info "配置轻量化系统服务..."
 if [ "$OS" = "alpine" ]; then
     cat > /etc/init.d/sing-box <<'OPENRC'
@@ -229,7 +226,8 @@ command_args="run -c /etc/sing-box/config.json"
 pidfile="/run/${RC_SVCNAME}.pid"
 command_background="yes"
 supervisor=supervise-daemon
-supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
+# 优化点：缩短复活等待时间至 1 秒，确保偶发被系统错杀时能在最快时间内无感原地复活
+supervise_daemon_args="--respawn-max 999 --respawn-delay 1"
 depend() { need net; }
 OPENRC
     chmod +x /etc/init.d/sing-box
@@ -245,7 +243,7 @@ Type=simple
 User=root
 ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
 Restart=on-failure
-RestartSec=5s
+RestartSec=2s
 [Install]
 WantedBy=multi-user.target
 SYSTEMD
@@ -254,8 +252,13 @@ SYSTEMD
     systemctl restart sing-box || true
 fi
 
-# -----------------------
-# 获取连接 IP
+# 自动刷新 iptables 放行自定义的 NAT 端口
+if command -v iptables >/dev/null 2>&1; then
+    iptables -I INPUT -p tcp --dport ${PORT_REALITY} -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -p udp --dport ${PORT_HY2} -j ACCEPT 2>/dev/null || true
+fi
+
+# 获取外网连接 IP
 if [ -n "${CUSTOM_IP}" ]; then
     PUB_IP="${CUSTOM_IP}"
 else
@@ -266,22 +269,22 @@ fi
 # 拼接并输出一键链接
 echo ""
 echo "=========================================="
-info "🎉 极限精简版 Sing-box 部署完成!"
+info "🎉 极限单端口 NAT 版 Sing-box 部署完成!"
 echo "=========================================="
 echo ""
 echo "🔗 VLESS Reality 节点链接："
 echo "vless://${UUID_REALITY}@${PUB_IP}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#Reality${suffix}"
 echo ""
-echo "🔗 Hysteria 2 节点链接："
+echo "🔗 Hysteria 2 节点链接（专为单端口锁死 hop=0 优化）："
 hy2_enc=$(url_encode "${PSK_HY2}")
-echo "hy2://${hy2_enc}@${PUB_IP}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#Hysteria2${suffix}"
+echo "hy2://${hy2_enc}@${PUB_IP}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1&hop=0#Hysteria2${suffix}"
 echo ""
 echo "=========================================="
 info "输入 sb 可召唤超轻量管理面板"
 echo "=========================================="
 
 # -----------------------
-# 创建纯文本缓存版管理面板
+# 创建纯文本缓存型高级 sb 管理后台
 SB_PATH="/usr/local/bin/sb"
 cat > "$SB_PATH" <<'SB_SCRIPT'
 #!/usr/bin/env bash
@@ -310,7 +313,7 @@ fi
 
 while true; do
     echo "=================================="
-    echo "  Sing-box 极轻量面板 (无jq安全版)"
+    echo "  Sing-box 极轻量面板 (单端口特调版)"
     echo "=================================="
     echo "1) 查看客户端节点链接"
     echo "2) 启动代理服务"
@@ -330,7 +333,7 @@ while true; do
             echo "vless://${UUID_REALITY}@${IP_SHOW}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#Reality${suffix}"
             echo -e "\n--- Hysteria 2 链接 ---"
             hy2_enc=$(printf "%s" "${PSK_HY2}" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
-            echo "hy2://${hy2_enc}@${IP_SHOW}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#Hysteria2${suffix}"
+            echo "hy2://${hy2_enc}@${IP_SHOW}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1&hop=0#Hysteria2${suffix}"
             echo ""
             ;;
         2) $CMD_START && echo "已下发启动指令。" ;;
