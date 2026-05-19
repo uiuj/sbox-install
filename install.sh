@@ -96,7 +96,6 @@ read -r CUSTOM_IP
 CUSTOM_IP="$(echo "$CUSTOM_IP" | tr -d '[:space:]')"
 
 echo "请输入 Reality 的 SNI (留空默认 itunes.apple.com):"
-# 🎯 已经改回你指定的默认伪装域名：itunes.apple.com
 REALITY_SNI="$(echo "${REALITY_SNI:-itunes.apple.com}" | tr -d '[:space:]')"
 
 # -----------------------
@@ -246,9 +245,9 @@ RestartSec=1s
 [Install]
 WantedBy=multi-user.target
 SYSTEMD
-        systemctl daemon-reload || true
-        systemctl enable sing-box >/dev/null 2>&1 || true
-        systemctl restart sing-box || true
+    systemctl daemon-reload || true
+    systemctl enable sing-box >/dev/null 2>&1 || true
+    systemctl restart sing-box || true
 fi
 
 # 自动刷新防火墙规则
@@ -284,7 +283,7 @@ info "输入 sb 可召唤超轻量管理面板"
 echo "=========================================="
 
 # -----------------------
-# 创建纯文本缓存版、免 jq 的高级 sb 管理后台
+# 创建纯文本缓存版、免 jq 的高级 sb 管理后台（精准嵌入更新菜单）
 SB_PATH="/usr/local/bin/sb"
 cat > "$SB_PATH" <<'SB_SCRIPT'
 #!/usr/bin/env bash
@@ -318,12 +317,13 @@ while true; do
     echo "1) 查看客户端节点链接"
     echo "2) 启动代理服务"
     echo "3) 停止代理服务"
-    echo "4) 重启代理服务"
+    echo "4) 重举代理服务"
     echo "5) 查看当前服务运行状态"
-    echo "6) 彻底卸载 sing-box"
+    echo "6) 更新 sing-box 核心 (一键安全升级)"
+    echo "7) 彻底卸载 sing-box"
     echo "0) 退出面板"
     echo "=================================="
-    read -p "请输入选项 [0-6]: " opt
+    read -p "请输入选项 [0-7]: " opt
     
     case "$opt" in
         1)
@@ -341,6 +341,35 @@ while true; do
         4) $CMD_REST && echo "已下发重启指令。" ;;
         5) echo "-----------------"; $CMD_STAT; echo "-----------------"; ;;
         6)
+            echo "正在检索 Github 最新 sing-box 稳定版版本号..."
+            # 免 jq 的全新轻量化版本抓取逻辑，确保 72MB 内存绝不爆满
+            LATEST_VER=$(curl -sSL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest | awk -F '"' '/tag_name/{print $4}' | sed 's/^v//')
+            
+            if [ -z "$LATEST_VER" ]; then
+                echo "[WARN] 无法连接 Github API 获取最新版，将默认尝试更新到 1.11.0"
+                LATEST_VER="1.11.0"
+            fi
+            
+            echo "准备将 sing-box 核心平滑升级至 v${LATEST_VER}..."
+            mkdir -p /tmp/sb-update && cd /tmp/sb-update
+            
+            ARCH="amd64"
+            if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then ARCH="arm64"; fi
+            
+            echo "下载中，请稍候..."
+            if curl -fSL --connect-timeout 15 --retry 3 -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-linux-${ARCH}.tar.gz"; then
+                tar -zxf sb.tar.gz
+                $CMD_STOP || true
+                mv sing-box-${LATEST_VER}-linux-${ARCH}/sing-box /usr/bin/sing-box
+                chmod +x /usr/bin/sing-box
+                $CMD_START || true
+                echo -e "\n\033[1;32m[SUCCESS] 核心已无缝平滑升级至 v${LATEST_VER}！\033[0m\n"
+            else
+                echo "[ERR] 下载失败，请检查网络后重试。"
+            fi
+            cd / && rm -rf /tmp/sb-update
+            ;;
+        7)
             read -p "确认完全卸载？(y/N): " un_confirm
             if [[ "$un_confirm" =~ ^[Yy]$ ]]; then
                 $CMD_STOP || true
