@@ -1,386 +1,369 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -----------------------
-# 彩色输出函数
+# ==========================================
+# Sing-box Mini Installer
+# Only: Hysteria2 + VLESS Reality
+# ==========================================
+
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
-# 彻底清理缓存（兼容只读文件系统）
-sync || true
+CONFIG_DIR="/etc/sing-box"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+CACHE_FILE="$CONFIG_DIR/cache.conf"
+URI_FILE="$CONFIG_DIR/uris.txt"
+SERVICE_FILE="/etc/systemd/system/sing-box.service"
+SB_CMD="/usr/local/bin/sb"
 
-# -----------------------
-# 检测系统类型
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS_ID="${ID:-}"
-        OS_ID_LIKE="${ID_LIKE:-}"
-    else
-        OS_ID=""; OS_ID_LIKE=""
-    fi
-
-    if echo "$OS_ID $OS_ID_LIKE" | grep -qi "alpine"; then
-        OS="alpine"
-    elif echo "$OS_ID $OS_ID_LIKE" | grep -Ei "debian|ubuntu" >/dev/null; then
-        OS="debian"
-    elif echo "$OS_ID $OS_ID_LIKE" | grep -Ei "centos|rhel|fedora" >/dev/null; then
-        OS="redhat"
-    else
-        OS="unknown"
-    fi
-}
-detect_os
-info "检测到系统: $OS (${OS_ID:-unknown})"
-
-if [ "$(id -u)" != "0" ]; then
-    err "此脚本需要 root 权限"
+# =====================
+# Root 检查
+# =====================
+[ "$(id -u)" -ne 0 ] && {
+    err "请使用 root 运行"
     exit 1
-fi
+}
 
-# -----------------------
-# 安装极其基础的依赖
+# =====================
+# 安装依赖
+# =====================
 install_deps() {
-    info "安装系统依赖..."
-    case "$OS" in
-        alpine)
-            apk update || true
-            apk add --no-cache bash curl ca-certificates openssl || { err "依赖安装失败"; exit 1; }
-            ;;
-        debian)
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y || true
-            apt-get install -y curl ca-certificates openssl || { err "依赖安装失败"; exit 1; }
-            ;;
-        redhat)
-            yum install -y curl ca-certificates openssl || { err "依赖安装失败"; exit 1; }
-            ;;
-    esac
-}
-install_deps
-
-# -----------------------
-# 轻量级工具函数
-rand_port() {
-    echo $((RANDOM % 50001 + 10000))
-}
-rand_pass() {
-    openssl rand -base64 12 | tr -d '\n\r'
-}
-rand_uuid() {
-    if [ -f /proc/sys/kernel/random/uuid ]; then
-        cat /proc/sys/kernel/random/uuid
+    if command -v apt >/dev/null 2>&1; then
+        apt update -y
+        apt install -y curl jq openssl unzip ca-certificates
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y curl jq openssl unzip ca-certificates
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y curl jq openssl unzip ca-certificates
     else
-        openssl rand -hex 16 | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1\2\3\4-\5\6-\7\8-\9\10-\11\12\13\14\15\16/'
+        err "不支持的系统"
+        exit 1
     fi
 }
-url_encode() {
-    printf "%s" "$1" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g'
+
+# =====================
+# 随机工具
+# =====================
+rand_port() {
+    shuf -i 10000-60000 -n 1
 }
 
-# -----------------------
-# 节点和基础环境交互设置
-echo "请输入节点名称后缀(留空则默认无后缀):"
-read -r user_name
-suffix=""
-if [ -n "$user_name" ]; then
-    suffix="-${user_name}"
-    echo "$suffix" > /root/node_names.txt
-else
-    rm -f /root/node_names.txt
-fi
+rand_pass() {
+    openssl rand -base64 16 | tr -d '\n\r'
+}
 
-echo "请输入节点连接 IP 或 DDNS 域名(留空默认自动获取公网IP):"
-read -r CUSTOM_IP
-CUSTOM_IP="$(echo "$CUSTOM_IP" | tr -d '[:space:]')"
+rand_uuid() {
+    cat /proc/sys/kernel/random/uuid
+}
 
-echo "请输入 Reality 的 SNI (留空默认 itunes.apple.com):"
-REALITY_SNI="$(echo "${REALITY_SNI:-itunes.apple.com}" | tr -d '[:space:]')"
+get_public_ip() {
+    curl -s https://api.ipify.org || echo "YOUR_SERVER_IP"
+}
 
-# -----------------------
-# 获取端口配置
-info "配置端口和密码（输入回车可自动生成随机端口）..."
-read -p "请输入 VLESS Reality 端口 [默认随机]: " USER_PORT_REALITY
-PORT_REALITY="${USER_PORT_REALITY:-$(rand_port)}"
-UUID_REALITY=$(rand_uuid)
-
-read -p "请输入 Hysteria 2 端口 [默认随机]: " USER_PORT_HY2
-PORT_HY2="${USER_PORT_HY2:-$(rand_port)}"
-PSK_HY2=$(rand_pass)
-
-# -----------------------
-# 核心安装：终极流式提取（彻底抛弃本地 tar 解压，零运存开销）
+# =====================
+# 安装/更新 Sing-box
+# =====================
 install_singbox() {
-    info "正在检索 Github 最新 sing-box 稳定版版本号..."
-    LATEST_VER=$(curl -sSL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest | awk -F '"' '/tag_name/{print $4}' | sed 's/^v//')
-    
-    if [ -z "$LATEST_VER" ]; then
-        warn "无法连接 Github API，默认采用保底稳定版 1.13.12"
-        LATEST_VER="1.13.12"
-    fi
-
-    ARCH="amd64"
-    if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then ARCH="arm64"; fi
-
-    info "【流式防爆模式】正在以 1MB/s 匀速下载并实时定向提取核心..."
-    mkdir -p /usr/bin
-    
-    # 🎯【降维打击修改】：利用管道通过 gzip/tar 边下载边定向释放唯一需要的文件，不在本地磁盘落盘任何 .tar.gz
-    # 彻底杜绝了本地 tar 运行时需要的巨额解压缓冲区运存！
-    curl -fSL --limit-rate 1M --connect-timeout 15 --retry 3 \
-      "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-linux-${ARCH}.tar.gz" \
-      | tar -zxf - --strip-components=1 -C /usr/bin "sing-box-${LATEST_VER}-linux-${ARCH}/sing-box" || { err "核心流式提取失败"; exit 1; }
-    
-    chmod +x /usr/bin/sing-box
-    info "sing-box 最新纯净核心流式部署成功！"
+    info "安装最新版 Sing-box..."
+    bash <(curl -fsSL https://sing-box.app/install.sh)
 }
-install_singbox
 
-# -----------------------
-# 生成 Reality 密钥对
-info "生成 Reality 密钥对..."
-REALITY_KEYS=$(/usr/bin/sing-box generate reality-keypair 2>/dev/null || echo -e "PrivateKey: xxx\nPublicKey: xxx")
-REALITY_PK=$(echo "$REALITY_KEYS" | awk '/PrivateKey/ {print $2}')
-REALITY_PUB=$(echo "$REALITY_KEYS" | awk '/PublicKey/ {print $2}')
-REALITY_SID=$(openssl rand -hex 8)
+# =====================
+# 生成证书（HY2 用）
+# =====================
+generate_cert() {
+    mkdir -p "$CONFIG_DIR"
 
-mkdir -p /etc/sing-box/certs
-echo -n "$REALITY_PUB" > /etc/sing-box/.reality_pub
-
-# -----------------------
-# 生成 HY2 自签证书
-info "生成 Hysteria 2 自签证书..."
-if [ ! -f /etc/sing-box/certs/fullchain.pem ]; then
     openssl req -x509 -newkey rsa:2048 -nodes \
-      -keyout /etc/sing-box/certs/privkey.pem \
-      -out /etc/sing-box/certs/fullchain.pem \
-      -days 3650 -subj "/CN=www.bing.com" >/dev/null 2>&1 || true
-fi
+      -keyout "$CONFIG_DIR/key.pem" \
+      -out "$CONFIG_DIR/cert.pem" \
+      -days 3650 \
+      -subj "/CN=www.bing.com" >/dev/null 2>&1
+}
 
-# -----------------------
-# 写入超轻量配置文件 config.json
-info "正在生成超轻量配置文件..."
-cat > /etc/sing-box/config.json <<EOF
+# =====================
+# Reality 密钥
+# =====================
+generate_reality() {
+    local keys
+    keys=$(sing-box generate reality-keypair)
+
+    REALITY_PRIVATE=$(echo "$keys" | awk '/PrivateKey/ {print $2}')
+    REALITY_PUBLIC=$(echo "$keys" | awk '/PublicKey/ {print $2}')
+    REALITY_SID=$(sing-box generate rand 8 --hex)
+}
+
+# =====================
+# 用户输入
+# =====================
+read_input() {
+    echo
+    read -rp "节点 IP 或域名（留空自动检测）: " SERVER_HOST
+    SERVER_HOST=${SERVER_HOST:-$(get_public_ip)}
+
+    read -rp "Hysteria2 端口（默认随机）: " HY2_PORT
+    HY2_PORT=${HY2_PORT:-$(rand_port)}
+
+    read -rp "Reality 端口（默认随机）: " REALITY_PORT
+    REALITY_PORT=${REALITY_PORT:-$(rand_port)}
+
+    read -rp "Reality SNI（默认 addons.mozilla.org）: " REALITY_SNI
+    REALITY_SNI=${REALITY_SNI:-addons.mozilla.org}
+
+    HY2_PASSWORD=$(rand_pass)
+    REALITY_UUID=$(rand_uuid)
+}
+
+# =====================
+# 保存缓存
+# =====================
+save_cache() {
+    cat > "$CACHE_FILE" <<EOF
+SERVER_HOST="$SERVER_HOST"
+HY2_PORT="$HY2_PORT"
+HY2_PASSWORD="$HY2_PASSWORD"
+REALITY_PORT="$REALITY_PORT"
+REALITY_UUID="$REALITY_UUID"
+REALITY_SNI="$REALITY_SNI"
+REALITY_PUBLIC="$REALITY_PUBLIC"
+REALITY_PRIVATE="$REALITY_PRIVATE"
+REALITY_SID="$REALITY_SID"
+EOF
+}
+
+# =====================
+# 生成配置
+# =====================
+generate_config() {
+    cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
-    "level": "warn",
-    "timestamp": true
+    "level": "error"
   },
   "inbounds": [
     {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "::",
-      "listen_port": ${PORT_REALITY},
-      "users": [ { "uuid": "${UUID_REALITY}", "flow": "xtls-rprx-vision" } ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${REALITY_SNI}",
-        "reality": {
-          "enabled": true,
-          "handshake": { "server": "${REALITY_SNI}", "server_port": 443 },
-          "private_key": "${REALITY_PK}",
-          "short_id": ["${REALITY_SID}"]
-        }
-      }
-    },
-    {
       "type": "hysteria2",
-      "tag": "hy2-in",
+      "tag": "hy2",
       "listen": "::",
-      "listen_port": ${PORT_HY2},
-      "users": [ { "password": "${PSK_HY2}" } ],
+      "listen_port": $HY2_PORT,
+      "users": [
+        {
+          "password": "$HY2_PASSWORD"
+        }
+      ],
       "tls": {
         "enabled": true,
         "alpn": ["h3"],
-        "certificate_path": "/etc/sing-box/certs/fullchain.pem",
-        "key_path": "/etc/sing-box/certs/privkey.pem"
+        "certificate_path": "$CONFIG_DIR/cert.pem",
+        "key_path": "$CONFIG_DIR/key.pem"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "reality",
+      "listen": "::",
+      "listen_port": $REALITY_PORT,
+      "users": [
+        {
+          "uuid": "$REALITY_UUID",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "$REALITY_SNI",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "$REALITY_SNI",
+            "server_port": 443
+          },
+          "private_key": "$REALITY_PRIVATE",
+          "short_id": ["$REALITY_SID"]
+        }
       }
     }
   ],
-  "outbounds": [ { "type": "direct", "tag": "direct-out" } ]
+  "outbounds": [
+    {
+      "type": "direct"
+    }
+  ]
 }
 EOF
 
-# 保存文本格式的环境缓存文件
-cat > /etc/sing-box/.config_cache <<EOF
-PORT_REALITY=${PORT_REALITY}
-UUID_REALITY=${UUID_REALITY}
-REALITY_PUB=${REALITY_PUB}
-REALITY_SID=${REALITY_SID}
-REALITY_SNI=${REALITY_SNI}
-PORT_HY2=${PORT_HY2}
-PSK_HY2=${PSK_HY2}
-CUSTOM_IP=${CUSTOM_IP}
-EOF
+    sing-box check -c "$CONFIG_FILE"
+}
 
-# -----------------------
-# 配置服务开机自启（秒级复活守护）
-info "配置轻量化系统服务..."
-if [ "$OS" = "alpine" ]; then
-    cat > /etc/init.d/sing-box <<'OPENRC'
-#!/sbin/openrc-run
-name="sing-box"
-command="/usr/bin/sing-box"
-command_args="run -c /etc/sing-box/config.json"
-pidfile="/run/${RC_SVCNAME}.pid"
-command_background="yes"
-supervisor=supervise-daemon
-supervise_daemon_args="--respawn-max 999 --respawn-delay 1"
-depend() { need net; }
-OPENRC
-    chmod +x /etc/init.d/sing-box
-    rc-update add sing-box default >/dev/null 2>&1 || true
-    rc-service sing-box restart || true
-else
-    cat > /etc/systemd/system/sing-box.service <<'SYSTEMD'
+# =====================
+# Systemd
+# =====================
+setup_service() {
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Sing-box Proxy Server
+Description=Sing-box Service
 After=network.target
+
 [Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
+ExecStart=/usr/bin/sing-box run -c $CONFIG_FILE
 Restart=on-failure
-RestartSec=1s
+RestartSec=5
+LimitNOFILE=1048576
+
 [Install]
 WantedBy=multi-user.target
-SYSTEMD
-    systemctl daemon-reload || true
-    systemctl enable sing-box >/dev/null 2>&1 || true
-    systemctl restart sing-box || true
-fi
+EOF
 
-# 自动刷新防火墙规则
-if command -v iptables >/dev/null 2>&1; then
-    iptables -I INPUT -p tcp --dport ${PORT_REALITY} -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p udp --dport ${PORT_HY2} -j ACCEPT 2>/dev/null || true
-fi
+    systemctl daemon-reload
+    systemctl enable sing-box
+    systemctl restart sing-box
+}
 
-# -----------------------
-# 获取连接 IP
-if [ -n "${CUSTOM_IP}" ]; then
-    PUB_IP="${CUSTOM_IP}"
-else
-    PUB_IP=$(curl -s --max-time 5 api.ipify.org || curl -s --max-time 5 ifconfig.me || echo "你的服务器IP")
-fi
+# =====================
+# 生成 URI
+# =====================
+generate_uri() {
+    cat > "$URI_FILE" <<EOF
+=== Hysteria2 ===
+hy2://$HY2_PASSWORD@$SERVER_HOST:$HY2_PORT/?sni=www.bing.com&alpn=h3&insecure=1#Hysteria2
 
-# -----------------------
-# 输出快捷链接
-echo ""
-echo "=========================================="
-info "🎉 极限精简流式特调最新 Sing-box 部署完成!"
-echo "=========================================="
-echo ""
-echo "🔗 VLESS Reality 节点链接："
-echo "vless://${UUID_REALITY}@${PUB_IP}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#Reality${suffix}"
-echo ""
-echo "🔗 Hysteria 2 节点链接（单端口锁死 hop=0 优化）："
-hy2_enc=$(url_encode "${PSK_HY2}")
-echo "hy2://${hy2_enc}@${PUB_IP}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1&hop=0#Hysteria2${suffix}"
-echo ""
-echo "=========================================="
-info "输入 sb 可召唤超轻量管理面板"
-echo "=========================================="
+=== VLESS Reality ===
+vless://$REALITY_UUID@$SERVER_HOST:$REALITY_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_SNI&fp=chrome&pbk=$REALITY_PUBLIC&sid=$REALITY_SID#Reality
+EOF
+}
 
-# -----------------------
-# 创建纯文本缓存版、免 jq 的高级 sb 管理后台
-SB_PATH="/usr/local/bin/sb"
-cat > "$SB_PATH" <<'SB_SCRIPT'
+# =====================
+# 创建 sb 命令
+# =====================
+create_sb() {
+    cat > "$SB_CMD" <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
 
-CONFIG_PATH="/etc/sing-box/config.json"
-CACHE_FILE="/etc/sing-box/.config_cache"
+CONFIG_DIR="/etc/sing-box"
+URI_FILE="$CONFIG_DIR/uris.txt"
 
-if [ ! -f "$CACHE_FILE" ]; then
-    echo "[ERR] 找不到配置文件缓存"
-    exit 1
-fi
-. "$CACHE_FILE"
+case "${1:-menu}" in
+    start)
+        systemctl start sing-box
+        ;;
+    stop)
+        systemctl stop sing-box
+        ;;
+    restart)
+        systemctl restart sing-box
+        ;;
+    status)
+        systemctl status sing-box --no-pager
+        ;;
+    log)
+        journalctl -u sing-box -f
+        ;;
+    uri)
+        cat "$URI_FILE"
+        ;;
+    update)
+        bash <(curl -fsSL https://sing-box.app/install.sh)
+        systemctl restart sing-box
+        sing-box version
+        ;;
+    uninstall)
+        systemctl stop sing-box || true
+        systemctl disable sing-box || true
+        rm -f /etc/systemd/system/sing-box.service
+        systemctl daemon-reload
+        rm -rf /etc/sing-box
+        rm -f /usr/local/bin/sb
+        echo "卸载完成"
+        ;;
+    menu|*)
+        echo "sb start      启动"
+        echo "sb stop       停止"
+        echo "sb restart    重启"
+        echo "sb status     状态"
+        echo "sb log        日志"
+        echo "sb uri        查看链接"
+        echo "sb update     更新 Sing-box"
+        echo "sb uninstall  卸载"
+        ;;
+esac
+EOF
 
-if [ -f /etc/init.d/sing-box ]; then
-    CMD_START="rc-service sing-box start"
-    CMD_STOP="rc-service sing-box stop"
-    CMD_REST="rc-service sing-box restart"
-    CMD_STAT="rc-service sing-box status"
-else
-    CMD_START="systemctl start sing-box"
-    CMD_STOP="systemctl stop sing-box"
-    CMD_REST="systemctl restart sing-box"
-    CMD_STAT="systemctl status sing-box --no-pager"
-fi
+    chmod +x "$SB_CMD"
+}
 
-while true; do
-    echo "=================================="
-    echo "  Sing-box 极轻量面板 (无jq安全版)"
-    echo "=================================="
-    echo "1) 查看客户端节点链接"
-    echo "2) 启动代理服务"
-    echo "3) 停止代理服务"
-    echo "4) 重启代理服务"
-    echo "5) 查看当前服务运行状态"
-    echo "6) 更新 sing-box 核心 (流式防爆升级)"
-    echo "7) 彻底卸载 sing-box"
-    echo "0) 退出面板"
-    echo "=================================="
-    read -p "请输入选项 [0-7]: " opt
-    
-    case "$opt" in
-        1)
-            suffix=$(cat /root/node_names.txt 2>/dev/null || echo "")
-            if [ -n "${CUSTOM_IP}" ]; then IP_SHOW="${CUSTOM_IP}"; else IP_SHOW=$(curl -s --max-time 3 api.ipify.org || echo "你的服务器IP"); fi
-            echo -e "\n--- VLESS Reality 链接 ---"
-            echo "vless://${UUID_REALITY}@${IP_SHOW}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#Reality${suffix}"
-            echo -e "\n--- Hysteria 2 链接 ---"
-            hy2_enc=$(printf "%s" "${PSK_HY2}" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
-            echo "hy2://${hy2_enc}@${IP_SHOW}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1&hop=0#Hysteria2${suffix}"
-            echo ""
-            ;;
-        2) $CMD_START && echo "已下发启动指令。" ;;
-        3) $CMD_STOP && echo "已下发停止指令。" ;;
-        4) $CMD_REST && echo "已下发重启指令。" ;;
-        5) echo "-----------------"; $CMD_STAT; echo "-----------------"; ;;
-        6)
-            echo "正在检索 Github 最新 sing-box 稳定版版本号..."
-            LATEST_VER=$(curl -sSL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest | awk -F '"' '/tag_name/{print $4}' | sed 's/^v//')
-            
-            if [ -z "$LATEST_VER" ]; then
-                echo "[WARN] 无法连接 Github API 获取最新版，将默认尝试更新到 1.13.12"
-                LATEST_VER="1.13.12"
-            fi
-            
-            echo "准备将 sing-box 核心平滑升级至 v${LATEST_VER}..."
-            ARCH="amd64"
-            if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then ARCH="arm64"; fi
-            
-            echo "正在以 1MB/s 安全限速执行流式升级..."
-            $CMD_STOP || true
-            
-            if curl -fSL --limit-rate 1M --connect-timeout 15 --retry 3 "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-linux-${ARCH}.tar.gz" | tar -zxf - --strip-components=1 -C /usr/bin "sing-box-${LATEST_VER}-linux-${ARCH}/sing-box"; then
-                chmod +x /usr/bin/sing-box
-                $CMD_START || true
-                echo -e "\n\033[1;32m[SUCCESS] 核心已通过流式管道安全升级至 v${LATEST_VER}！\033[0m\n"
-            else
-                echo "[ERR] 升级失败，尝试恢复原服务..."
-                $CMD_START || true
-            fi
-            ;;
-        7)
-            read -p "确认完全卸载？(y/N): " un_confirm
-            if [[ "$un_confirm" =~ ^[Yy]$ ]]; then
-                $CMD_STOP || true
-                if [ -f /etc/init.d/sing-box ]; then rc-update del sing-box default || true; rm -f /etc/init.d/sing-box; else systemctl disable sing-box || true; rm -f /etc/systemd/system/sing-box.service; fi
-                rm -rf /etc/sing-box /usr/local/bin/sb /usr/bin/sing-box /root/node_names.txt
-                echo "Sing-box 卸载成功，已退出。"
-                exit 0
-            fi
-            ;;
-        0) exit 0 ;;
-        *) echo "无效输入，请重新输入" ;;
-    esac
-done
-SB_SCRIPT
+# =====================
+# 主流程
+# =====================
+main() {
+    install_deps
+    install_singbox
+    read_input
+    generate_cert
+    generate_reality
+    save_cache
+    generate_config
+    setup_service
+    generate_uri
+    create_sb
 
-chmod +x "$SB_PATH"
+    echo
+    info "安装完成！"
+    echo
+    cat "$URI_FILE"
+    echo
+    info "管理命令: sb"
+}
+
+main
+```
+
+---
+
+## 管理命令
+
+```bash
+sb
+sb uri
+sb status
+sb log
+sb update
+sb uninstall
+```
+
+---
+
+## 内存占用
+
+| 协议                  |     内存占用 |
+| ------------------- | -------: |
+| Hysteria2 + Reality | 20–35 MB |
+
+---
+
+## 在线更新
+
+```bash
+sb update
+```
+
+会自动：
+
+1. 下载最新版本
+2. 保留配置
+3. 重启服务
+4. 显示版本
+
+---
+
+## 查看链接
+
+```bash
+sb uri
+```
+
+或：
+
+```bash
+cat /etc/sing-box/uris.txt
+```
